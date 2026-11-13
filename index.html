@@ -125,6 +125,7 @@ input{-webkit-user-select:text;user-select:text}
 .iconbtn{position:relative;width:40px;height:40px;padding:0;border:2px solid var(--ink);background:transparent;color:var(--ink);font-size:18px;display:grid;place-items:center}
 .dotbadge{position:absolute;top:-8px;right:-8px;min-width:20px;height:20px;padding:0 4px;border-radius:10px;background:var(--hit);color:#fff;font:700 12px system-ui;display:grid;place-items:center}
 .linkbar{margin:0 0 8px;padding:8px 12px;border-radius:10px;background:var(--hit);color:#fff;font-weight:600;font-size:14px}
+.linkbar.info{background:var(--btn)}
 .score{font:700 14px system-ui;letter-spacing:.08em;color:var(--mut);text-align:center;margin:-2px 0 8px}
 .tip{font-size:13px;color:var(--mut);margin-top:18px;text-align:center}
 
@@ -165,7 +166,7 @@ input{-webkit-user-select:text;user-select:text}
      2. Utils      $, esc, wins, Store
      3. State      S: єдиний стан; freshGame, inGame
      4. Domain     Board, Fleet: правила гри; Names, Pair: ніки та статистика
-     5. Services   Sound, Keep, Net (транспорт), Session (збереження)
+     5. Services   Sound, Keep, Wake, Shell, Net (транспорт), Session (збереження)
      6. Logic      Placement, Chat, Game
      7. UI         Drag, UI, Views, Actions
      8. Boot       події, з’єднання хуків, запуск
@@ -184,6 +185,8 @@ const CFG = {
   dragGuardMs: 400,                      // ігнорувати «клік» одразу після перетягування
   nickMax: 16, chatMax: 300, chatKeep: 100,
   sessionMs: 6 * 3600e3,                 // скільки сервер тримає кімнату
+  wakeSlowMs: 1500,                      // після скількох мс без відповіді сервера показати «прокидається»
+  keepWarmMs: 10 * 60 * 1000,            // як часто «торкатись» сервера, щоб він не засинав
 };
 const TOTAL_SHIPS = Object.values(CFG.fleet).reduce((a, b) => a + b, 0);
 const SIZES = Object.keys(CFG.fleet).map(Number).sort((a, b) => b - a);
@@ -373,6 +376,33 @@ const Keep = {
       Keep.lock = await navigator.wakeLock.request('screen');
       Keep.lock.addEventListener('release', () => (Keep.lock = null));
     } catch {}
+  },
+};
+
+/** Безкоштовний сервер засинає без запитів: будимо його, показуємо стан і не даємо заснути, поки гра відкрита */
+const Wake = {
+  state: 'ok',                         // 'ok' | 'waking' | 'down'
+  hooks: { change() {} },
+  set(state) { if (Wake.state !== state) { Wake.state = state; Wake.hooks.change(); } },
+  async ping() {
+    const slow = setTimeout(() => Wake.set('waking'), CFG.wakeSlowMs);
+    try { const r = await fetch('/healthz', { cache: 'no-store' }); Wake.set(r.ok ? 'ok' : 'down'); }
+    catch { Wake.set('down'); }
+    clearTimeout(slow);
+  },
+  start() { Wake.ping(); setInterval(Wake.ping, CFG.keepWarmMs); },
+};
+
+/** Оболонка гри в кеші браузера (sw.js): відкривається миттєво; повідомляє, коли на сервері нова версія */
+const Shell = {
+  updated: false,
+  hooks: { change() {} },
+  register() {
+    if (!('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+    navigator.serviceWorker.addEventListener('message', e => {
+      if (e.data && e.data.t === 'update') { Shell.updated = true; Shell.hooks.change(); }
+    });
   },
 };
 
@@ -751,7 +781,7 @@ const UI = {
     const msg = S.msg; S.msg = '';
     const enter = UI.lastPhase !== S.phase; UI.lastPhase = S.phase;
     $('#app').innerHTML =
-      UI.top() + (S.link === 'down' ? '<div class="linkbar">Зв’язок втрачено. Відновлюємо…</div>' : '') +
+      UI.top() + UI.banners() +
       `<main class="${enter ? 'enter' : ''}">${Views[S.phase]()}<p class="err">${esc(msg)}</p></main>` +
       (S.fleetOpen ? UI.fleetSheet() : '');
     UI.renderChat();
@@ -781,6 +811,12 @@ const UI = {
   },
 
   /* ---- компоненти ---- */
+  /** Смуги стану: зв’язок у грі, сервер прокидається, нова версія */
+  banners: () =>
+    (S.link === 'down' ? '<div class="linkbar">Зв’язок втрачено. Відновлюємо…</div>' : '') +
+    (!inGame() && Wake.state === 'waking' ? '<div class="linkbar info">Сервер прокидається… це може тривати до хвилини</div>' : '') +
+    (!inGame() && Wake.state === 'down' ? '<div class="linkbar">Немає зв’язку із сервером</div>' : '') +
+    (Shell.updated ? '<div class="linkbar info" data-act="reload">Є нова версія гри. Торкнись, щоб оновити</div>' : ''),
   top: () => `<header class="top">${ICON.anchor}<h1>Морський бій</h1><div class="tools">` +
     (inGame() ? `<button class="iconbtn" data-act="chat" aria-label="Чат">💬${S.chat.unread ? `<span class="dotbadge">${S.chat.unread}</span>` : ''}</button>` : '') +
     `<button class="iconbtn" data-act="sound" aria-label="Звук">${Sound.on ? '🔊' : '🔇'}</button></div></header>`,
@@ -895,6 +931,7 @@ const Actions = {
     S.nick = v; Store.set('mb-nick', v); UI.render();
   },
   sound() { Sound.toggle(); UI.render(); },
+  reload() { location.reload(); },
 
   /* з’єднання */
   async host() {
@@ -965,6 +1002,8 @@ Object.assign(Net.hooks, {
   closed: msg => Actions.toMenu(msg),
   committed: Session.save,
 });
+Object.assign(Wake.hooks, { change: UI.render });
+Object.assign(Shell.hooks, { change: UI.render });
 
 /* Один обробник кліків на всю сторінку */
 document.addEventListener('click', e => {
@@ -991,6 +1030,7 @@ document.addEventListener('pointerdown', e => {
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return Session.save();
+  Wake.ping();
   if (inGame()) Keep.on();
 });
 
@@ -1000,6 +1040,8 @@ document.addEventListener('keydown', e => {
 
 Session.restore();
 UI.render();
+Shell.register();
+Wake.start();
 </script>
 </body>
 </html>
